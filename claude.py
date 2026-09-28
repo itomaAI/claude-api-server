@@ -1,5 +1,8 @@
 """claude CLI の起動と出力の解釈。
 
+claude は道具も MCP サーバーも持たない、純粋な LLM として起動する。
+入力は stream-json(1行の JSON)。画像・文書をコンテンツブロックのまま渡すため。
+
 プロンプトは CLI 引数ではなく stdin で渡す。CLI 引数には Linux の1引数あたりの
 長さ上限(MAX_ARG_STRLEN, 通常128KB)があり、会話履歴を載せると
 "OSError: [Errno 7] Argument list too long" になるため。
@@ -173,7 +176,11 @@ def _system_prompt_file(system_prompt: str) -> Iterator[Optional[str]]:
 
 
 def build_command(plan: Plan, system_prompt_file: Optional[str]) -> list[str]:
-    """claude の起動引数を組み立てる(プロンプト本体は stdin で渡すのでここには入れない)。"""
+    """claude の起動引数を組み立てる(中身は stdin で渡すのでここには入れない)。
+
+    claude は stream-json の入力に stream-json の出力を要求するので、
+    出力の形もここで決める(非ストリームの経路も同じ出力から結果を拾う)。
+    """
     cmd = [CLAUDE_BIN, "-p"]
 
     if plan.resume_id:
@@ -182,11 +189,17 @@ def build_command(plan: Plan, system_prompt_file: Optional[str]) -> list[str]:
         # セッションを残さない従来動作。再利用するにはセッション永続化が要るので付けない。
         cmd += ["--no-session-persistence"]
 
-    if plan.has_attachment:
-        # 添付があるときだけ Read を許可し、非対話でも確認待ちにならないようにする。
-        cmd += ["--tools", "Read", "--permission-mode", "dontAsk"]
-    else:
-        cmd += ["--tools", ""]
+    # 純粋な LLM API として動かす: 組み込みの道具も MCP サーバーも載せない。
+    # --tools "" が外すのは組み込みの道具だけで、利用者の設定や claude.ai 側で
+    # 繋いだ MCP サーバーは残る。--mcp-config を渡さずに --strict-mcp-config を
+    # 付けると MCP は 0 個になる(2.1.280 で確認)。
+    cmd += ["--tools", "", "--strict-mcp-config"]
+
+    cmd += [
+        "--input-format", "stream-json",
+        "--output-format", "stream-json",
+        "--verbose",
+    ]
 
     if system_prompt_file:
         cmd += ["--system-prompt-file", system_prompt_file]
@@ -195,6 +208,30 @@ def build_command(plan: Plan, system_prompt_file: Optional[str]) -> list[str]:
     if plan.effort:
         cmd += ["--effort", plan.effort]
     return cmd
+
+
+def stdin_payload(plan: Plan) -> bytes:
+    """claude の stdin へ渡す stream-json の1行(user メッセージ1つ)。"""
+    message = {
+        "type": "user",
+        "message": {"role": "user", "content": plan.blocks},
+    }
+    return (json.dumps(message, ensure_ascii=False) + "\n").encode()
+
+
+def parse_result_event(stdout: bytes) -> Optional[dict]:
+    """stream-json の出力から最後の result イベントを拾う。無ければ None。"""
+    found: Optional[dict] = None
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            found = event
+    return found
 
 
 async def _spawn(cmd: list[str], limit: Optional[int] = None) -> asyncio.subprocess.Process:
@@ -217,7 +254,7 @@ async def usage_report() -> str:
     なので、CLI のバージョンアップで動かなくなる可能性がある(2.1.237 で確認)。
     """
     cmd = [CLAUDE_BIN, "-p", "--output-format", "json",
-           "--tools", "", "--no-session-persistence"]
+           "--tools", "", "--strict-mcp-config", "--no-session-persistence"]
     proc = await _spawn(cmd)
     try:
         stdout, stderr = await asyncio.wait_for(
@@ -241,22 +278,21 @@ async def usage_report() -> str:
 
 
 async def run(plan: Plan) -> RunResult:
-    """--output-format json で1回実行し、結果をまとめて返す。"""
+    """1回実行し、結果をまとめて返す(出力は stream-json。result イベントを拾う)。"""
     with _system_prompt_file(plan.system_prompt) as spf:
-        cmd = build_command(plan, spf) + ["--output-format", "json"]
-        proc = await _spawn(cmd)
-        stdout, stderr = await proc.communicate(input=plan.prompt.encode())
+        cmd = build_command(plan, spf)
+        proc = await _spawn(cmd, limit=STREAM_LINE_LIMIT)
+        stdout, stderr = await proc.communicate(input=stdin_payload(plan))
 
     result = RunResult(returncode=proc.returncode, stderr=stderr)
     if result.failed:
         return result
 
-    try:
-        data = json.loads(stdout.decode())
-    except json.JSONDecodeError as exc:
+    data = parse_result_event(stdout)
+    if data is None:
         raise ClaudeError(
             f"could not parse claude output: {stdout.decode(errors='replace')[:2000]}"
-        ) from exc
+        )
 
     result.session_id = data.get("session_id")
     result.usage = data.get("usage") or {}
@@ -264,14 +300,14 @@ async def run(plan: Plan) -> RunResult:
     if result.is_error:
         result.error_message = str(data.get("result") or "unknown error")
     else:
-        result.reply = data.get("result", "")
+        result.reply = data.get("result") or ""
     return result
 
 
 async def stream(
     plan: Plan, cut_after: Optional[list[str]] = None
 ) -> AsyncIterator[tuple[str, object]]:
-    """--output-format stream-json で実行し、テキスト差分を逐次流す。
+    """部分メッセージつきの stream-json で実行し、テキスト差分を逐次流す。
 
     ("text", str) を出力があるたびに、最後に必ず ("result", RunResult) を1回 yield する。
     cut_after が指定されていれば CutFilter を通す。切り位置に達しても、応答が
@@ -284,14 +320,10 @@ async def stream(
     cutter = CutFilter(cut_after)
 
     with _system_prompt_file(plan.system_prompt) as spf:
-        cmd = build_command(plan, spf) + [
-            "--output-format", "stream-json",
-            "--include-partial-messages",
-            "--verbose",
-        ]
+        cmd = build_command(plan, spf) + ["--include-partial-messages"]
         proc = await _spawn(cmd, limit=STREAM_LINE_LIMIT)
 
-        proc.stdin.write(plan.prompt.encode())
+        proc.stdin.write(stdin_payload(plan))
         await proc.stdin.drain()
         proc.stdin.close()
 

@@ -66,7 +66,13 @@ curl -s http://127.0.0.1:8811/v1/chat/completions \
 
 - 非ストリーミング / ストリーミング(SSE)
 - `content` は文字列でも content-parts 配列でも可
-- 画像・ファイル添付(data URI をディスクに落とし、Read ツール経由で読ませる)
+- 画像・ファイル添付(data URI)。ツールを介さず、コンテンツブロックのまま claude へ渡す
+  - 画像(`image/*`) → image ブロック。大きさ・形式の調整は claude 側がやる
+    (9.7MB の JPEG、幅 9000px の PNG、BMP が通ることを確認済み)
+  - PDF → document ブロック
+  - 文字として読めるファイル(`text/*`・JSON・SVG など UTF-8 で読めるもの) → 本文へ埋め込む
+  - それ以外のバイナリ(zip など) → 送らず、その旨の注記に置き換える
+  - system メッセージの添付は送れない(注記に置き換える)。data URI でない URL も同じ
 - `usage`(プロンプトキャッシュの内訳込み)
 - 思考レベル: `reasoning_effort`(OpenAI 互換名)または `effort`。
   値は `low` / `medium` / `high` / `xhigh` / `max`(`minimal` は `low` に読み替え)。
@@ -79,6 +85,7 @@ curl -s http://127.0.0.1:8811/v1/chat/completions \
 | 項目 | 挙動 |
 |---|---|
 | `tools` / function calling | **黙って無視される**(エラーにならないので注意) |
+| claude 側の道具・MCP サーバー | **載せない**。純粋な LLM として動く(`--tools ""` と `--strict-mcp-config`) |
 | `temperature` / `max_tokens` / `n` / `response_format` など | 黙って無視(`claude -p` に対応するフラグが無い) |
 | `role: "tool"` のメッセージ | 422 |
 | 末尾が assistant のメッセージ列(prefill) | 400 |
@@ -174,15 +181,25 @@ Anthropic のプロンプトキャッシュはプレフィックス一致で、�
 
 ### 実装上の要点
 
+- **claude は道具も MCP も持たない**。`--tools ""` が外すのは組み込みの道具だけで、
+  利用者の設定や claude.ai 側で繋いだ MCP サーバーは残る。`--mcp-config` を渡さずに
+  `--strict-mcp-config` を付けると 0 個になる(claude 2.1.280 で確認)。
+- **入力は stream-json**(`--input-format stream-json`)。stdin へ user メッセージ1つを
+  1行の JSON で渡す。画像・文書をブロックのまま渡せるのはこの形だけ。
+  claude は stream-json の入力に stream-json の出力を要求するので、非ストリームの
+  経路も同じ出力から `result` イベントを拾う。
 - **プロンプトは stdin 経由**。CLI 引数には Linux の1引数あたりの長さ上限
   (`MAX_ARG_STRLEN`, 通常128KB)があり、会話履歴を載せると
   `OSError: [Errno 7] Argument list too long` になる。system prompt も同じ理由で
   `--system-prompt-file` を使う。
 - **`--bare` は使わない**。bare は `ANTHROPIC_API_KEY` 認証を強制し、
   OAuth(サブスク課金)を無効化してしまう。
-- **添付ファイルの保存パスは内容のハッシュ由来**。同じ添付が常に同じパスに落ちるので
-  会話ハッシュが安定し、セッション再利用が効く。
-- **stream-json の読み取り上限を拡張**。1行に添付の base64 が載ることがあり、
+- **会話ハッシュには添付の中身ではなく、内容のハッシュの印を入れる**
+  (`[Attached image: image/png sha256:…]`)。同じ添付は常に同じ印になるので
+  会話ハッシュが安定し、セッション再利用が効く。添付をディスクへは保存しない。
+- **引き当てが外れたとき**は全履歴を1つの user メッセージに畳む。過去のターンの
+  添付は、その位置にブロックとして挟まる。
+- **stream-json の読み取り上限を拡張**。1行が長くなることがあり、
   asyncio の `readline()` 既定上限(64KB)では足りない。
 
 ## テスト

@@ -10,7 +10,6 @@ CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 WORKDIR = os.environ.get(
     "CLAUDE_API_WORKDIR", os.path.expanduser("~/.claude-api-workdir")
 )
-ATTACH_DIR = os.path.join(WORKDIR, "attachments")
 TMP_DIR = os.path.join(WORKDIR, "tmp")
 
 # --- セッション再利用(プロンプトキャッシュ最適化) ---
@@ -26,8 +25,8 @@ LOOKBACK_TURNS = 8
 # 同時に保持する会話ロックの上限。
 MAX_CONV_LOCKS = 256
 
-# stream-json の1行は Read ツール経由の base64 を含みうるので、asyncio の
-# readline() 既定上限(64KB)では足りない。クライアント側の添付上限に余裕を持たせた値。
+# stream-json の1行は長くなりうる(長い応答が1イベントに載る)ので、asyncio の
+# readline() 既定上限(64KB)では足りない。余裕を持たせた値。
 STREAM_LINE_LIMIT = 100 * 1024 * 1024
 
 # --- /v1/models で返すモデル ---
@@ -54,5 +53,4 @@ ERROR_DUMP = os.environ.get("CLAUDE_API_ERROR_DUMP", "1") != "0"
 
 
 def ensure_dirs() -> None:
-    os.makedirs(ATTACH_DIR, exist_ok=True)
     os.makedirs(TMP_DIR, exist_ok=True)

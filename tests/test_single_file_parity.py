@@ -42,7 +42,6 @@ def test_render_messages_parity(messages):
     a = mod_conv.render_messages(messages)
     b = single.render_messages(messages)
     assert a.system_prompt == b.system_prompt
-    assert a.system_has_attachment == b.system_has_attachment
     assert [(t.role, t.text) for t in a.turns] == [(t.role, t.text) for t in b.turns]
 
 
@@ -51,6 +50,7 @@ def test_render_turns_parity(messages):
     a = mod_conv.render_messages(messages).turns
     b = single.render_messages(messages).turns
     assert mod_conv.render_turns(a) == single.render_turns(b)
+    assert mod_conv.render_blocks(a) == single.render_blocks(b)
 
 
 @pytest.mark.parametrize("messages", CONVERSATIONS)
@@ -71,13 +71,37 @@ def test_invalid_conversation_parity():
         single.render_messages(bad)
 
 
-def test_attachment_path_parity(tmp_path, monkeypatch):
-    monkeypatch.setattr(mod_conv, "ATTACH_DIR", str(tmp_path))
-    monkeypatch.setattr(single, "ATTACH_DIR", str(tmp_path))
-    uri = "data:text/plain;base64," + base64.b64encode(b"same bytes").decode()
-    part = [{"type": "file", "file": {"filename": "a.txt", "file_data": uri}}]
+def _uri(mime: str, raw: bytes) -> str:
+    return f"data:{mime};base64," + base64.b64encode(raw).decode()
 
-    assert mod_conv.render_content(part) == single.render_content(part)
+
+ATTACHED = [
+    [{"type": "text", "text": "look"},
+     {"type": "image_url", "image_url": {"url": _uri("image/png", b"\x89PNG fake")}}],
+    [{"type": "file", "file": {"filename": "a.pdf",
+                               "file_data": _uri("application/pdf", b"%PDF-1.7 fake")}}],
+    [{"type": "file", "file": {"filename": "a.txt",
+                               "file_data": _uri("text/plain", b"same bytes")}}],
+    [{"type": "file", "file": {"filename": "a.bin",
+                               "file_data": _uri("application/zip", b"\x00\x01\xff")}}],
+    [{"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}],
+]
+
+
+@pytest.mark.parametrize("content", ATTACHED)
+def test_attachment_parity(content):
+    a = mod_conv.render_messages([Msg("system", "S"), Msg("user", content)])
+    b = single.render_messages([Msg("system", "S"), Msg("user", content)])
+    assert [(t.role, t.text) for t in a.turns] == [(t.role, t.text) for t in b.turns]
+    assert mod_conv.render_blocks(a.turns) == single.render_blocks(b.turns)
+    assert mod_conv.conversation_key("S", None, None, a.turns) == \
+        single.conversation_key("S", None, None, b.turns)
+
+
+def test_system_attachment_parity():
+    msgs = [Msg("system", ATTACHED[0]), user("hi")]
+    assert mod_conv.render_messages(msgs).system_prompt == \
+        single.render_messages(msgs).system_prompt
 
 
 @pytest.fixture
@@ -97,7 +121,7 @@ def _plan_pair(messages, model="sonnet", effort=None):
 
 def test_build_plan_parity_first_turn(isolated_stores):
     a, b = _plan_pair(CONVERSATIONS[0])
-    assert (a.resume_id, a.prompt) == (b.resume_id, b.prompt)
+    assert (a.resume_id, a.prompt, a.blocks) == (b.resume_id, b.prompt, b.blocks)
 
 
 def test_build_plan_parity_after_register(isolated_stores):
@@ -109,6 +133,7 @@ def test_build_plan_parity_after_register(isolated_stores):
     a2, b2 = _plan_pair(CONVERSATIONS[1])
     assert a2.resume_id == b2.resume_id == "sess-1"
     assert a2.prompt == b2.prompt == "again"
+    assert a2.blocks == b2.blocks
 
 
 def test_build_plan_parity_tampered_reply(isolated_stores):
@@ -136,31 +161,51 @@ def test_fallback_to_full_parity(isolated_stores):
     a2.fallback_to_full()
     b2.fallback_to_full()
     assert a2.prompt == b2.prompt
+    assert a2.blocks == b2.blocks
     assert a2.resume_id is None and b2.resume_id is None
 
 
+IMAGE_BLOCK = {
+    "type": "image",
+    "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"},
+}
+
+
 @pytest.mark.parametrize(
-    "resume_id,has_attachment,model,effort",
+    "resume_id,content,model,effort",
     [
-        (None, False, None, None),
-        (None, True, "sonnet", None),
-        ("sess-1", False, "opus", "high"),
-        ("sess-1", True, None, "low"),
+        (None, [], None, None),
+        (None, [IMAGE_BLOCK], "sonnet", None),
+        ("sess-1", [], "opus", "high"),
+        ("sess-1", [{"type": "text", "text": "t"}, IMAGE_BLOCK], None, "low"),
     ],
 )
-def test_build_command_parity(resume_id, has_attachment, model, effort):
+def test_build_command_and_payload_parity(resume_id, content, model, effort):
     kwargs = dict(
         prompt="p",
         system_prompt="s",
-        has_attachment=has_attachment,
         turns=[],
+        content=content,
         model=model,
         effort=effort,
         resume_id=resume_id,
     )
-    a = mod_claude.build_command(mod_conv.Plan(**kwargs), "/tmp/sys.txt")
-    b = single.build_command(single.Plan(**kwargs), "/tmp/sys.txt")
-    assert a == b
+    a, b = mod_conv.Plan(**kwargs), single.Plan(**kwargs)
+    assert mod_claude.build_command(a, "/tmp/sys.txt") == \
+        single.build_command(b, "/tmp/sys.txt")
+    assert mod_claude.stdin_payload(a) == single.stdin_payload(b)
+    assert a.has_attachment == b.has_attachment
+
+
+def test_parse_result_event_parity():
+    out = (
+        b'{"type":"system","subtype":"init","session_id":"s"}\n'
+        b'not json\n'
+        b'{"type":"result","is_error":false,"result":"hi","session_id":"s"}\n'
+    )
+    assert mod_claude.parse_result_event(out) == single.parse_result_event(out)
+    assert mod_claude.parse_result_event(b"") is None
+    assert single.parse_result_event(b"") is None
 
 
 def test_usage_conversion_parity():

@@ -3,7 +3,6 @@
     python3 -m pytest tests -q
 """
 
-import base64
 import os
 import sys
 from dataclasses import dataclass
@@ -20,8 +19,10 @@ from conversation import (  # noqa: E402
     build_plan,
     conversation_key,
     conversation_root_key,
-    render_content,
+    parts_text,
+    render_blocks,
     render_messages,
+    render_parts,
     render_turns,
 )
 from sessions import SessionStore  # noqa: E402
@@ -43,22 +44,21 @@ def user(text: str) -> Msg:
 # --------------------------------------------------------------------------
 
 def test_plain_string_content():
-    assert render_content("hello") == ("hello", False)
+    assert render_parts("hello") == ["hello"]
 
 
 def test_content_parts_are_concatenated():
-    text, attached = render_content(
-        [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]
-    )
-    assert (text, attached) == ("ab", False)
+    parts = render_parts([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}])
+    assert parts_text(parts) == "ab"
+    assert all(isinstance(p, str) for p in parts)
 
 
 def test_non_data_uri_image_is_flagged_not_attached():
-    text, attached = render_content(
+    parts = render_parts(
         [{"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}]
     )
-    assert attached is False
-    assert "omitted" in text
+    assert all(isinstance(p, str) for p in parts)
+    assert "omitted" in parts_text(parts)
 
 
 def test_system_messages_are_collected_separately():
@@ -83,20 +83,13 @@ def test_multi_turn_rendering_labels_speakers():
     assert rendered == "User: a\n\nAssistant: b\n\nUser: c"
 
 
-# --------------------------------------------------------------------------
-# 添付ファイル: 同じ内容は同じパスへ (会話ハッシュを安定させるため)
-# --------------------------------------------------------------------------
-
-def test_same_attachment_maps_to_same_path(tmp_path, monkeypatch):
-    monkeypatch.setattr(cv, "ATTACH_DIR", str(tmp_path))
-    uri = "data:text/plain;base64," + base64.b64encode(b"payload").decode()
-    part = [{"type": "file", "file": {"filename": "a.txt", "file_data": uri}}]
-
-    first, attached = render_content(part)
-    second, _ = render_content(part)
-
-    assert attached is True
-    assert first == second, "同じ添付は毎回同じパスに落ちる必要がある"
+def test_text_only_blocks_are_one_text_block_equal_to_the_rendered_text():
+    """文字だけの会話では、送る中身は render_turns と同じ文字列の text ブロック1つ。"""
+    for turns in (
+        [Turn("user", "hi")],
+        [Turn("user", "a"), Turn("assistant", "b"), Turn("user", "c")],
+    ):
+        assert render_blocks(turns) == [{"type": "text", "text": render_turns(turns)}]
 
 
 # --------------------------------------------------------------------------
@@ -138,6 +131,7 @@ def test_first_turn_misses_and_sends_everything(store):
     plan = build_plan(convo, "sonnet", None)
     assert plan.resume_id is None
     assert plan.prompt == "hello"
+    assert plan.blocks == [{"type": "text", "text": "hello"}]
     assert cv.STATS["miss"] == 1
 
 
@@ -153,6 +147,7 @@ def test_next_turn_resumes_and_sends_only_the_delta(store):
 
     assert plan2.resume_id == "sess-1"
     assert plan2.prompt == "again", "差分ターンのみを送る"
+    assert plan2.blocks == [{"type": "text", "text": "again"}]
     assert cv.STATS["hit"] == 1
 
 
@@ -198,6 +193,7 @@ def test_fallback_to_full_restores_whole_history(store):
     plan.fallback_to_full()
     assert plan.resume_id is None
     assert plan.prompt == "User: hello\n\nAssistant: world\n\nUser: again"
+    assert plan.blocks == [{"type": "text", "text": plan.prompt}]
 
 
 def test_session_reuse_disabled_always_sends_everything(store, monkeypatch):
